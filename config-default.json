@@ -1,0 +1,9 @@
+{
+  "display": "primary",
+  "topmost": true,
+  "passthrough": true,
+  "localOverlay": true,
+  "volume": 0.9,
+  "active": "",
+  "clips": []
+}

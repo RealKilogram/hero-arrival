@@ -1,0 +1,215 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<title>英雄登场 · 浏览器源</title>
+<style>
+  html, body { margin: 0; height: 100%; background: transparent; overflow: hidden; }
+  canvas { display: block; width: 100vw; height: 100vh; }
+</style>
+</head>
+<body>
+<canvas id="stage"></canvas>
+<script>
+const canvas = document.getElementById('stage');
+const ctx = canvas.getContext('2d', { alpha: true });
+const params = new URLSearchParams(location.search);
+const WANT_SOUND = params.get('sound') === '1';
+const DEFAULT_CLIP = params.get('clip') || '';
+
+const AHEAD = 90, CONCURRENCY = 4;
+
+let clip = null;          // { id, dir, count, fps, width, height }
+let cache = new Map();
+let loading = new Map();
+let token = 0;
+let playing = false;
+let timer = 0;
+let lastIdx = -1;
+
+let audioCtx = null;
+let soundBufs = [];
+let currentSound = null;
+
+function fit() {
+  const dpr = window.devicePixelRatio || 1;
+  canvas.width = Math.round(innerWidth * dpr);
+  canvas.height = Math.round(innerHeight * dpr);
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+}
+
+function frameUrl(i) {
+  return clip.dir + '/frames/' + String(i).padStart(3, '0') + '.webp';
+}
+
+function decodeTarget() {
+  const dpr = window.devicePixelRatio || 1;
+  const tw = Math.max(2, Math.round(innerWidth * dpr));
+  const ar = clip.width && clip.height ? clip.height / clip.width : 1400 / 2560;
+  return [tw, Math.max(2, Math.round(tw * ar))];
+}
+
+async function decodeOne(i, myToken) {
+  if (cache.has(i)) return cache.get(i);
+  if (loading.has(i)) return loading.get(i);
+  const p = (async () => {
+    try {
+      const [tw, th] = decodeTarget();
+      const r = await fetch(frameUrl(i));
+      if (!r.ok) throw new Error('HTTP ' + r.status);
+      const blob = await r.blob();
+      if (myToken !== token) return null;
+      const bmp = await createImageBitmap(blob, { resizeWidth: tw, resizeHeight: th, resizeQuality: 'medium' });
+      if (myToken !== token) { bmp.close && bmp.close(); return null; }
+      cache.set(i, bmp);
+      return bmp;
+    } catch (e) {
+      return null;
+    } finally {
+      loading.delete(i);
+    }
+  })();
+  loading.set(i, p);
+  return p;
+}
+
+async function ensureRange(from, to, myToken) {
+  const queue = [];
+  for (let i = from; i < to; i++) if (!cache.has(i)) queue.push(i);
+  let ptr = 0;
+  const lane = async () => {
+    while (ptr < queue.length) {
+      if (myToken !== token) return;
+      await decodeOne(queue[ptr++], myToken);
+    }
+  };
+  await Promise.all(Array.from({ length: CONCURRENCY }, lane));
+}
+
+async function evictOld(center) {
+  const lo = center - 40;
+  for (const [i, bmp] of cache) {
+    if (i < lo) { bmp.close && bmp.close(); cache.delete(i); }
+  }
+}
+
+function drawBitmap(bmp) {
+  const cw = innerWidth, ch = innerHeight;
+  const scale = Math.max(cw / bmp.width, ch / bmp.height);
+  const dw = bmp.width * scale, dh = bmp.height * scale;
+  ctx.clearRect(0, 0, cw, ch);
+  ctx.drawImage(bmp, (cw - dw) / 2, (ch - dh) / 2, dw, dh);
+}
+
+function clearStage() { ctx.clearRect(0, 0, innerWidth, innerHeight); }
+
+async function loadSounds(id, names) {
+  soundBufs = [];
+  if (!WANT_SOUND || !Array.isArray(names) || !names.length) return;
+  try {
+    if (!audioCtx) audioCtx = new AudioContext();
+    const bufs = await Promise.all(names.map(async (n) => {
+      try {
+        const rr = await fetch('assets/clips/' + id + '/sounds/' + encodeURIComponent(n));
+        if (!rr.ok) return null;
+        return await audioCtx.decodeAudioData(await rr.arrayBuffer());
+      } catch (e) { return null; }
+    }));
+    soundBufs = bufs.filter(Boolean);
+    console.log('[livesrc] sounds', soundBufs.length);
+  } catch (e) { console.log('[livesrc] sound fail', e.message); }
+}
+
+function playSound() {
+  if (!audioCtx || !soundBufs.length) return;
+  try {
+    if (audioCtx.state === 'suspended') audioCtx.resume();
+    if (currentSound) { try { currentSound.stop(); } catch (e) {} }
+    const buf = soundBufs[Math.floor(Math.random() * soundBufs.length)];
+    const src = audioCtx.createBufferSource();
+    src.buffer = buf;
+    src.connect(audioCtx.destination);
+    src.start();
+    currentSound = src;
+  } catch (e) {}
+}
+
+async function useClip(id) {
+  id = id || DEFAULT_CLIP || 'aemeath';
+  if (clip && clip.id === id) return true;
+  token += 1;
+  const myToken = token;
+  for (const [, b] of cache) b.close && b.close();
+  cache.clear();
+  loading.clear();
+  let meta = null;
+  try {
+    const r = await fetch('assets/clips/' + id + '/clip.json');
+    if (r.ok) meta = await r.json();
+  } catch (e) { /* ignore */ }
+  clip = {
+    id,
+    dir: 'assets/clips/' + id,
+    count: (meta && Number(meta.count)) || 60,
+    fps: (meta && Number(meta.fps)) || 60,
+    width: (meta && Number(meta.width)) || 0,
+    height: (meta && Number(meta.height)) || 0
+  };
+  const head = Math.min(clip.count, Math.max(20, Math.round(clip.fps)));
+  await ensureRange(0, head, myToken);
+  if (myToken !== token) return false;
+  loadSounds(id, meta && meta.sounds);
+  console.log('[livesrc] clip', id, clip.count, 'cached', cache.size);
+  return cache.size > 0;
+}
+
+async function play(clipId) {
+  if (playing) return;
+  const ok = await useClip(clipId);
+  if (!ok) return;
+  playing = true;
+  lastIdx = -1;
+  playSound();
+  const interval = 1000 / clip.fps;
+  const total = interval * clip.count;
+  const t0 = performance.now();
+  const first = cache.get(0);
+  if (first) drawBitmap(first);
+
+  clearInterval(timer);
+  timer = setInterval(() => {
+    if (!playing) return;
+    const elapsed = performance.now() - t0;
+    if (elapsed >= total) { finish(); return; }
+    const idx = Math.min(clip.count - 1, Math.floor(elapsed / interval));
+    if (idx === lastIdx) return;
+    const bmp = cache.get(idx);
+    if (bmp) { drawBitmap(bmp); lastIdx = idx; }
+    if (lastIdx % 20 === 0) ensureRange(lastIdx, Math.min(clip.count, lastIdx + AHEAD), token).then(() => evictOld(lastIdx));
+  }, 1000 / 120);
+}
+
+function finish() {
+  playing = false;
+  clearInterval(timer);
+  timer = 0;
+  clearStage();
+  console.log('[livesrc] finish');
+}
+
+window.addEventListener('resize', () => { fit(); });
+
+const es = new EventSource('/events');
+es.onopen = () => console.log('[livesrc] sse open');
+es.onmessage = (ev) => {
+  let data = null;
+  try { data = JSON.parse(ev.data); } catch (e) { data = { seq: Number(ev.data) || 0, clip: '' }; }
+  console.log('[livesrc] trigger', data && data.seq, data && data.clip);
+  play(data && data.clip);
+};
+
+fit();
+useClip(DEFAULT_CLIP).then((ok) => { if (ok) clearStage(); });
+</script>
+</body>
+</html>
